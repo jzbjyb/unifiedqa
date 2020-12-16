@@ -14,6 +14,7 @@ from data import QAData, MyDataLoader
 class UnifiedQAData(QAData):
 
     def __init__(self, logger, args, data_path, is_training):
+        '''
         self.unified_dataset = [
             "narrativeqa",
             "ai2_science_middle", "ai2_science_elementary",
@@ -23,6 +24,8 @@ class UnifiedQAData(QAData):
             "boolq",
             "race_string",
             "openbookqa"]
+        '''
+        self.unified_dataset = ["arc_hard_with_ir", "arc_easy_with_ir"]
         self.data_path = data_path
         self.data_type = data_path.split("/")[-1][:-4]
         assert self.data_type in ["train", "dev", "test"]
