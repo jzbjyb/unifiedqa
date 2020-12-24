@@ -46,6 +46,7 @@ def main():
     parser.add_argument("--do_lowercase", action='store_true')
 
     # Preprocessing/decoding-related parameters
+    parser.add_argument('--lm_format', action='store_true')
     parser.add_argument('--max_input_length', type=int, default=512)
     parser.add_argument('--max_output_length', type=int, default=100)
     parser.add_argument('--num_beams', type=int, default=4)

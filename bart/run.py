@@ -3,18 +3,22 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
-from transformers import BartTokenizer, BartConfig
+from transformers import BartTokenizer, BartConfig, GPT2TokenizerFast
 from transformers import AdamW, get_linear_schedule_with_warmup
 
 from data import QAData
 from unified_data import UnifiedQAData
 from bart import MyBart
+from gpt2 import MyGPT2
 
 def run(args, logger):
-    tokenizer = BartTokenizer.from_pretrained("bart-large")
+    if args.lm_format:
+        tokenizer = GPT2TokenizerFast.from_pretrained('gpt2-xl')
+    else:
+        tokenizer = BartTokenizer.from_pretrained("bart-large")
 
     if args.is_unifiedqa:
-        dev_data = UnifiedQAData(logger, args, args.predict_file, False)
+        dev_data = UnifiedQAData(logger, args, args.predict_file, is_training=False, lm_format=args.lm_format)
     else:
         dev_data = QAData(logger, args, args.predict_file, False)
 
@@ -24,17 +28,24 @@ def run(args, logger):
 
     if args.do_train:
         if args.is_unifiedqa:
-            train_data = UnifiedQAData(logger, args, args.train_file, True)
+            train_data = UnifiedQAData(logger, args, args.train_file, is_training=True, lm_format=args.lm_format)
         else:
             train_data = QAData(logger, args, args.train_file, True)
         train_data.load_dataset(tokenizer)
         train_data.load_dataloader()
 
         if args.checkpoint is not None:
-            model = MyBart.from_pretrained("bart-large",
-                                           state_dict=torch.load(args.checkpoint))
+            if args.lm_format:
+                model = MyGPT2.from_pretrained("gpt2-xl", state_dict=torch.load(args.checkpoint))
+                #model.parallelize()
+            else:
+                model = MyBart.from_pretrained("bart-large", state_dict=torch.load(args.checkpoint))
         else:
-            model = MyBart.from_pretrained("bart-large")
+            if args.lm_format:
+                model = MyGPT2.from_pretrained("gpt2-xl")
+                #model.parallelize()
+            else:
+                model = MyBart.from_pretrained("bart-large")
         if args.n_gpu>1:
             model = torch.nn.DataParallel(model)
         if args.n_gpu>0:
@@ -83,12 +94,15 @@ def train(args, logger, model, train_data, dev_data, optimizer, scheduler):
 
     logger.info("Starting training!")
     for epoch in range(int(args.num_train_epochs)):
-        for batch in train_data.dataloader:
+        for batch in tqdm(train_data.dataloader, disable=False):
             global_step += 1
             batch = [b.to(torch.device("cuda")) for b in batch]
-            loss = model(input_ids=batch[0], attention_mask=batch[1],
-                         decoder_input_ids=batch[2], decoder_attention_mask=batch[3],
-                         is_training=True)
+            if args.lm_format:
+                loss = model(input_ids=batch[0], attention_mask=batch[1], loss_mask=batch[2], labels=batch[0])
+            else:
+                loss = model(input_ids=batch[0], attention_mask=batch[1],
+                             decoder_input_ids=batch[2], decoder_attention_mask=batch[3],
+                             is_training=True)
             if args.n_gpu > 1:
                 loss = loss.mean() # mean() to average on multi-gpu.
             if torch.isnan(loss).data:

@@ -13,8 +13,7 @@ from data import QAData, MyDataLoader
 
 class UnifiedQAData(QAData):
 
-    def __init__(self, logger, args, data_path, is_training):
-        '''
+    def __init__(self, logger, args, data_path, is_training, lm_format: bool=False):
         self.unified_dataset = [
             "narrativeqa",
             "ai2_science_middle", "ai2_science_elementary",
@@ -24,8 +23,6 @@ class UnifiedQAData(QAData):
             "boolq",
             "race_string",
             "openbookqa"]
-        '''
-        self.unified_dataset = ["arc_hard_with_ir", "arc_easy_with_ir"]
         self.data_path = data_path
         self.data_type = data_path.split("/")[-1][:-4]
         assert self.data_type in ["train", "dev", "test"]
@@ -62,6 +59,7 @@ class UnifiedQAData(QAData):
         self.dataloader = None
         self.cache = None
         self.metric = "Accuracy"
+        self.lm_format = lm_format
 
     def __len__(self):
         return np.sum([len(d["question"]) for d in self.data.values()])
@@ -84,7 +82,10 @@ class UnifiedQAData(QAData):
         if self.load and os.path.exists(preprocessed_path):
             self.logger.info("Loading pre-tokenized data from {}".format(preprocessed_path))
             with open(preprocessed_path, "r") as f:
-                input_ids, attention_mask, decoder_input_ids, decoder_attention_mask, metadata = json.load(f)
+                if self.lm_format:
+                    input_ids, attention_mask, loss_mask, metadata = json.load(f)
+                else:
+                    input_ids, attention_mask, decoder_input_ids, decoder_attention_mask, metadata = json.load(f)
         else:
             print ("Start tokenizing...")
             metadata, questions, answers = [], [], []
@@ -98,23 +99,42 @@ class UnifiedQAData(QAData):
             if self.args.append_another_bos:
                 questions = ["<s> "+question for question in questions]
                 answers = ["<s> " +answer for answer in answers]
-            question_input = self.tokenizer.batch_encode_plus(questions,
-                                                            pad_to_max_length=True,
-                                                            max_length=self.args.max_input_length)
-            answer_input = self.tokenizer.batch_encode_plus(answers,
-                                                            pad_to_max_length=True)
-            input_ids, attention_mask = question_input["input_ids"], question_input["attention_mask"]
-            decoder_input_ids, decoder_attention_mask = answer_input["input_ids"], answer_input["attention_mask"]
-            print ("Finish tokenizering...")
-            if self.load:
-                with open(preprocessed_path, "w") as f:
-                    json.dump([input_ids, attention_mask,
-                               decoder_input_ids, decoder_attention_mask, metadata], f)
+            if self.lm_format:
+                question_input = self.tokenizer.batch_encode_plus(questions, max_length=self.args.max_input_length)
+                answer_input = self.tokenizer.batch_encode_plus(answers, max_length=self.args.max_output_length - 1)
+                input_ids = [q + a + [tokenizer.eos_token_id] + [0] * (self.args.max_input_length + self.args.max_output_length - len(q) - len(a) - 1)
+                             for q, a in zip(question_input['input_ids'], answer_input['input_ids'])]
+                attention_mask = [q + a + [1] + [0] * (self.args.max_input_length + self.args.max_output_length - len(q) - len(a) - 1)
+                                  for q, a in zip(question_input['attention_mask'], answer_input['attention_mask'])]
+                loss_mask = [[0] * len(q) + [1] * (len(a) + 1) + [0] * (self.args.max_input_length + self.args.max_output_length - len(q) - len(a) - 1)
+                             for q, a in zip(question_input['attention_mask'], answer_input['attention_mask'])]
+                print("Finish tokenizering...")
+                if self.load:
+                    with open(preprocessed_path, "w") as f:
+                        json.dump([input_ids, attention_mask, loss_mask, metadata], f)
+            else:
+                question_input = self.tokenizer.batch_encode_plus(questions,
+                                                                pad_to_max_length=True,
+                                                                max_length=self.args.max_input_length)
+                answer_input = self.tokenizer.batch_encode_plus(answers,
+                                                                pad_to_max_length=True)
+                input_ids, attention_mask = question_input["input_ids"], question_input["attention_mask"]
+                decoder_input_ids, decoder_attention_mask = answer_input["input_ids"], answer_input["attention_mask"]
+                print ("Finish tokenizering...")
+                if self.load:
+                    with open(preprocessed_path, "w") as f:
+                        json.dump([input_ids, attention_mask,
+                                   decoder_input_ids, decoder_attention_mask, metadata], f)
 
         self.metadata = metadata
-        self.dataset = MyUnifiedQADataset(input_ids, attention_mask,
-                                          decoder_input_ids, decoder_attention_mask,
-                                          metadata=metadata, is_training=self.is_training)
+        if self.lm_format:
+            self.dataset = MyUnifiedQADataset(input_ids, attention_mask,
+                                              loss_mask=loss_mask,
+                                              metadata=metadata, is_training=self.is_training, lm_format=self.lm_format)
+        else:
+            self.dataset = MyUnifiedQADataset(input_ids, attention_mask,
+                                              decoder_input_ids=decoder_input_ids, decoder_attention_mask=decoder_attention_mask,
+                                              metadata=metadata, is_training=self.is_training, lm_format=self.lm_format)
 
 
     def load_dataloader(self, do_return=False):
@@ -171,18 +191,29 @@ def normalize_answer(s):
 
 class MyUnifiedQADataset(Dataset):
     def __init__(self,
-                 input_ids, attention_mask,
-                 decoder_input_ids, decoder_attention_mask,
-                 metadata,
-                 is_training=False):
+                 input_ids,
+                 attention_mask,
+                 decoder_input_ids=None,
+                 decoder_attention_mask=None,
+                 loss_mask=None,
+                 metadata=None,
+                 is_training=False,
+                 lm_format: bool=False):
+        self.lm_format = lm_format
         self.input_ids = torch.LongTensor(input_ids)
         self.attention_mask = torch.LongTensor(attention_mask)
-        self.decoder_input_ids = torch.LongTensor(decoder_input_ids)
-        self.decoder_attention_mask = torch.LongTensor(decoder_attention_mask)
+        if lm_format:
+            self.loss_mask = torch.LongTensor(loss_mask)
+        else:
+            self.decoder_input_ids = torch.LongTensor(decoder_input_ids)
+            self.decoder_attention_mask = torch.LongTensor(decoder_attention_mask)
         self.metadata = metadata
         self.is_training = is_training
 
-        assert len(self.input_ids)==len(self.attention_mask)==len(self.decoder_input_ids)==len(self.decoder_attention_mask)
+        if lm_format:
+            assert len(self.input_ids)==len(self.attention_mask)==len(self.loss_mask)
+        else:
+            assert len(self.input_ids)==len(self.attention_mask)==len(self.decoder_input_ids)==len(self.decoder_attention_mask)
         assert len(self.input_ids)==metadata[-1][-1]
 
         self.indices = [np.random.permutation(range(start, end)) for start, end in self.metadata]
@@ -206,6 +237,8 @@ class MyUnifiedQADataset(Dataset):
         dp_idx = self.indices[idx][self.positions[idx]]
         self.positions[idx] += 1
 
-        return self.input_ids[dp_idx], self.attention_mask[dp_idx], \
-            self.decoder_input_ids[dp_idx], self.decoder_attention_mask[dp_idx]
-
+        if self.lm_format:
+            return self.input_ids[dp_idx], self.attention_mask[dp_idx], self.loss_mask[dp_idx]
+        else:
+            return self.input_ids[dp_idx], self.attention_mask[dp_idx], \
+                self.decoder_input_ids[dp_idx], self.decoder_attention_mask[dp_idx]
