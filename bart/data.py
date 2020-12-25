@@ -209,13 +209,13 @@ class MyQADataset(Dataset):
 
 class MyDataLoader(DataLoader):
 
-    def __init__(self, args, dataset, is_training):
+    def __init__(self, args, dataset, is_training, sampler=None):
         if is_training:
-            sampler=RandomSampler(dataset)
+            if sampler is None:
+                sampler=RandomSampler(dataset)
             batch_size = args.train_batch_size
         else:
-            sampler=SequentialSampler(dataset)
+            if sampler is None:
+                sampler=SequentialSampler(dataset)
             batch_size = args.predict_batch_size
-        super(MyDataLoader, self).__init__(dataset, sampler=sampler, batch_size=batch_size)
-
-
+        super(MyDataLoader, self).__init__(dataset, sampler=sampler, batch_size=batch_size, pin_memory=True)

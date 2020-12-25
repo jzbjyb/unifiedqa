@@ -1,8 +1,11 @@
 import os
 import numpy as np
 from tqdm import tqdm
+import logging
+import random
 
 import torch
+import torch.distributed as dist
 from transformers import BartTokenizer, BartConfig, GPT2TokenizerFast
 from transformers import AdamW, get_linear_schedule_with_warmup
 
@@ -11,9 +14,32 @@ from unified_data import UnifiedQAData
 from bart import MyBart
 from gpt2 import MyGPT2
 
-def run(args, logger):
+def run(gpu, args):
+    rank = gpu
+    dist.init_process_group(
+        backend='nccl',
+        init_method='env://',
+        world_size=args.world_size,
+        rank=rank
+    )
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    log_filename = "{}log-gpu{}.txt".format("" if args.do_train else "eval_", gpu)
+
+    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                        datefmt='%m/%d/%Y %H:%M:%S',
+                        level=logging.INFO,
+                        handlers=[logging.FileHandler(os.path.join(args.output_dir, log_filename)), logging.StreamHandler()])
+    logger = logging.getLogger(__name__)
+    logger.info(args)
+    logger.info(args.output_dir)
+
     if args.lm_format:
-        tokenizer = GPT2TokenizerFast.from_pretrained('gpt2-xl')
+        tokenizer = GPT2TokenizerFast.from_pretrained('gpt2-large')
     else:
         tokenizer = BartTokenizer.from_pretrained("bart-large")
 
@@ -32,24 +58,29 @@ def run(args, logger):
         else:
             train_data = QAData(logger, args, args.train_file, True)
         train_data.load_dataset(tokenizer)
-        train_data.load_dataloader()
+        sampler = torch.utils.data.distributed.DistributedSampler(train_data, num_replicas=args.world_size, rank=rank)
+        train_data.load_dataloader(sampler)
 
         if args.checkpoint is not None:
             if args.lm_format:
-                model = MyGPT2.from_pretrained("gpt2-xl", state_dict=torch.load(args.checkpoint))
+                model = MyGPT2.from_pretrained("gpt2-large", state_dict=torch.load(args.checkpoint))
                 #model.parallelize()
             else:
                 model = MyBart.from_pretrained("bart-large", state_dict=torch.load(args.checkpoint))
         else:
             if args.lm_format:
-                model = MyGPT2.from_pretrained("gpt2-xl")
+                model = MyGPT2.from_pretrained("gpt2-large")
                 #model.parallelize()
             else:
                 model = MyBart.from_pretrained("bart-large")
+        '''
         if args.n_gpu>1:
             model = torch.nn.DataParallel(model)
         if args.n_gpu>0:
             model.to(torch.device("cuda"))
+        '''
+        torch.cuda.set_device(gpu)
+        model.cuda(gpu)
 
         no_decay = ['bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
@@ -57,10 +88,9 @@ def run(args, logger):
             {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
             ]
         optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-        scheduler =  get_linear_schedule_with_warmup(optimizer,
-                                        num_warmup_steps=args.warmup_steps,
-                                        num_training_steps=100000)
-        train(args, logger, model, train_data, dev_data, optimizer, scheduler)
+        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.steps)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+        train(args, logger, model, train_data, dev_data, optimizer, scheduler, rank)
 
     if args.do_predict:
         checkpoint = os.path.join(args.output_dir, 'best-model.pt') if args.checkpoint is None else args.checkpoint
@@ -73,7 +103,7 @@ def run(args, logger):
         ems = inference(model, dev_data, save_predictions=True)
         logger.info("%s on %s data: %.2f" % (dev_data.metric, dev_data.data_type, np.mean(ems)*100))
 
-def train(args, logger, model, train_data, dev_data, optimizer, scheduler):
+def train(args, logger, model, train_data, dev_data, optimizer, scheduler, rank):
     model.train()
     global_step = 0
     train_losses = []
@@ -94,7 +124,7 @@ def train(args, logger, model, train_data, dev_data, optimizer, scheduler):
 
     logger.info("Starting training!")
     for epoch in range(int(args.num_train_epochs)):
-        for batch in tqdm(train_data.dataloader, disable=False):
+        for batch in tqdm(train_data.dataloader, disable=rank != 0):
             global_step += 1
             batch = [b.to(torch.device("cuda")) for b in batch]
             if args.lm_format:
@@ -103,11 +133,17 @@ def train(args, logger, model, train_data, dev_data, optimizer, scheduler):
                 loss = model(input_ids=batch[0], attention_mask=batch[1],
                              decoder_input_ids=batch[2], decoder_attention_mask=batch[3],
                              is_training=True)
+            '''
             if args.n_gpu > 1:
                 loss = loss.mean() # mean() to average on multi-gpu.
+            '''
             if torch.isnan(loss).data:
                 logger.info("Stop training because loss=%s" % (loss.data))
                 stop_training=True
+                break
+            if global_step >= args.steps:
+                logger.info("Stop training at {}" % global_step)
+                stop_training = True
                 break
             train_losses.append(loss.detach().cpu())
             loss.backward()
@@ -118,18 +154,14 @@ def train(args, logger, model, train_data, dev_data, optimizer, scheduler):
                 scheduler.step()
                 model.zero_grad()
 
-            if global_step % args.eval_period == 0:
+            if global_step % args.eval_period == 0 and rank == 0:
                 if args.skip_inference:
-                    logger.info("Step %d (epoch %d) Train loss %.2f" % (
-                            global_step,
-                            epoch,
-                            np.mean(train_losses)))
+                    logger.info("Step %d (epoch %d) Train loss %.2f" % (global_step, epoch, np.mean(train_losses)))
                     train_losses = []
                     model_state_dict = {k:v.cpu() for (k, v) in model.state_dict().items()}
                     if args.n_gpu > 1:
                         model_state_dict = convert_to_single_gpu(model_state_dict)
-                    torch.save(model_state_dict, os.path.join(args.output_dir,
-                                                              "best-model-{}.pt".format(str(global_step).zfill(6))))
+                    torch.save(model_state_dict, os.path.join(args.output_dir, "best-model-{}.pt".format(str(global_step).zfill(6))))
                 else:
                     model.eval()
                     curr_em = inference(model if args.n_gpu==1 else model.module, dev_data)

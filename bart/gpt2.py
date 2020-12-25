@@ -13,7 +13,7 @@ class MyGPT2(GPT2LMHeadModel):
                 inputs_embeds=None,
                 labels=None,
                 loss_mask=None,
-                use_cache=True,):
+                use_cache=True):
 
         transformer_outputs = self.transformer(
             input_ids,

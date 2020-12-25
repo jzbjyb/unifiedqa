@@ -137,8 +137,8 @@ class UnifiedQAData(QAData):
                                               metadata=metadata, is_training=self.is_training, lm_format=self.lm_format)
 
 
-    def load_dataloader(self, do_return=False):
-        self.dataloader = MyDataLoader(self.args, self.dataset, self.is_training)
+    def load_dataloader(self, do_return=False, sampler=None):
+        self.dataloader = MyDataLoader(self.args, self.dataset, self.is_training, sampler=sampler)
         if do_return:
             return self.dataloader
 
