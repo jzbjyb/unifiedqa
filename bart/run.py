@@ -141,8 +141,8 @@ def train(args, logger, model, train_data, dev_data, optimizer, scheduler, rank)
                 logger.info("Stop training because loss=%s" % (loss.data))
                 stop_training=True
                 break
-            if global_step >= args.steps:
-                logger.info("Stop training at {}" % global_step)
+            if global_step > args.steps:
+                logger.info("Stop training at {%d}" % global_step)
                 stop_training = True
                 break
             train_losses.append(loss.detach().cpu())
