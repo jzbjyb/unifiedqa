@@ -7,8 +7,9 @@ from tqdm import tqdm
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from transformers import BartTokenizer, AdamW, get_linear_schedule_with_warmup
+from transformers import BartTokenizer, GPT2TokenizerFast, AdamW, get_linear_schedule_with_warmup
 from bart import MyBart
+from gpt2 import MyGPT2
 CLEAN_TEST_DOMAINS = [('arc_hard', ('train', 'dev', 'test')),
                       ('ai2_science_middle', ('train', 'dev', 'test')),
                       ('mctest_corrected_the_separator', ('train', 'dev')),
@@ -95,9 +96,11 @@ def string_to_tensor(tokenizer,
                      max_target_len: int,
                      max_token_per_batch: int=None,
                      append_bos: bool=False,
+                     append_eos: bool=False,
                      num_options: int=0,
+                     qa_merge: bool=False,
                      device: str='cuda') -> Tuple[Dict[str, torch.Tensor], List[int]]:
-  combine = {'input': [], 'input_mask': [], 'target': [], 'target_mask': [], 'sample_ind': []}
+  combine = {'input': [], 'input_mask': [], 'target': [], 'target_mask': [], 'sample_ind': [], 'loss_mask': []}
   max_inp_len = max_tar_len = 0
   n_question = -1
   n_option = 0
@@ -105,24 +108,28 @@ def string_to_tensor(tokenizer,
   for id, input, target in data:
     if append_bos:
       input, target = '<s> ' + input, '<s> ' + target
-    # tokenize
+    # tokenize and truncate
     t_input = tokenizer.batch_encode_plus([input], max_length=max_input_len)  # <s> </s>
-    t_target = tokenizer.batch_encode_plus([target], max_length=max_target_len)  # <s> </s>
-    # truncate
+    t_target = tokenizer.batch_encode_plus([target], max_length=max_target_len - int(append_eos))  # <s> </s>
     inp = t_input['input_ids'][0]
-    tar = t_target['input_ids'][0]
+    tar = t_target['input_ids'][0] + [tokenizer.eos_token_id] * int(append_eos)
     inp_att = t_input['attention_mask'][0]
-    tar_att = t_target['attention_mask'][0]
+    tar_att = t_target['attention_mask'][0] + [1] * int(append_eos)
     # yield or not
     if max(len(inp), max_inp_len) * (len(combine['input']) + 1) + \
       max(len(tar), max_tar_len) * (len(combine['target']) + 1) > max_token_per_batch and (not num_options or id != prev_id):
-      combine['input'] = pad_sequence([torch.LongTensor(i) for i in combine['input']], batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
-      combine['input_mask'] = pad_sequence([torch.LongTensor(i) for i in combine['input_mask']], batch_first=True, padding_value=0).to(device)
-      combine['target'] = pad_sequence([torch.LongTensor(i) for i in combine['target']], batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
-      combine['target_mask'] = pad_sequence([torch.LongTensor(i) for i in combine['target_mask']], batch_first=True, padding_value=0).to(device)
+      if qa_merge:
+        combine['loss_mask'] = pad_sequence([torch.LongTensor([0] * len(q) + [1] * len(a)) for q, a in zip(combine['input_mask'], combine['target_mask'])], batch_first=True, padding_value=0).to(device)
+        combine['input'] = pad_sequence([torch.LongTensor(q + a) for q, a in zip(combine['input'], combine['target'])], batch_first=True, padding_value=0).to(device)
+        combine['input_mask'] = pad_sequence([torch.LongTensor(q + a) for q, a in zip(combine['input_mask'], combine['target_mask'])], batch_first=True, padding_value=0).to(device)
+      else:
+        combine['input'] = pad_sequence([torch.LongTensor(i) for i in combine['input']], batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
+        combine['input_mask'] = pad_sequence([torch.LongTensor(i) for i in combine['input_mask']], batch_first=True, padding_value=0).to(device)
+        combine['target'] = pad_sequence([torch.LongTensor(i) for i in combine['target']], batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
+        combine['target_mask'] = pad_sequence([torch.LongTensor(i) for i in combine['target_mask']], batch_first=True, padding_value=0).to(device)
       combine['sample_ind'] = torch.LongTensor(combine['sample_ind']).to(device)
       yield n_question + 1, combine
-      combine = {'input': [], 'input_mask': [], 'target': [], 'target_mask': [], 'sample_ind': []}
+      combine = {'input': [], 'input_mask': [], 'target': [], 'target_mask': [], 'sample_ind': [], 'loss_mask': []}
       max_inp_len = max_tar_len = 0
       n_question = -1
       n_option = 0
@@ -141,10 +148,15 @@ def string_to_tensor(tokenizer,
     max_inp_len = max(max_inp_len, len(inp))
     max_tar_len = max(max_tar_len, len(tar))
   if len(combine['input']) > 0:
-    combine['input'] = pad_sequence([torch.LongTensor(i) for i in combine['input']], batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
-    combine['input_mask'] = pad_sequence([torch.LongTensor(i) for i in combine['input_mask']], batch_first=True, padding_value=0).to(device)
-    combine['target'] = pad_sequence([torch.LongTensor(i) for i in combine['target']], batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
-    combine['target_mask'] = pad_sequence([torch.LongTensor(i) for i in combine['target_mask']], batch_first=True, padding_value=0).to(device)
+    if qa_merge:
+      combine['loss_mask'] = pad_sequence([torch.LongTensor([0] * len(q) + [1] * len(a)) for q, a in zip(combine['input_mask'], combine['target_mask'])], batch_first=True, padding_value=0).to(device)
+      combine['input'] = pad_sequence([torch.LongTensor(q + a) for q, a in zip(combine['input'], combine['target'])], batch_first=True, padding_value=0).to(device)
+      combine['input_mask'] = pad_sequence([torch.LongTensor(q + a) for q, a in zip(combine['input_mask'], combine['target_mask'])], batch_first=True, padding_value=0).to(device)
+    else:
+      combine['input'] = pad_sequence([torch.LongTensor(i) for i in combine['input']], batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
+      combine['input_mask'] = pad_sequence([torch.LongTensor(i) for i in combine['input_mask']], batch_first=True, padding_value=0).to(device)
+      combine['target'] = pad_sequence([torch.LongTensor(i) for i in combine['target']], batch_first=True, padding_value=tokenizer.pad_token_id).to(device)
+      combine['target_mask'] = pad_sequence([torch.LongTensor(i) for i in combine['target_mask']], batch_first=True, padding_value=0).to(device)
     combine['sample_ind'] = torch.LongTensor(combine['sample_ind']).to(device)
     yield n_question + 1, combine
 
@@ -153,6 +165,7 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='score targets using models from transformers')
   parser.add_argument('--task', type=str, choices=['score', 'softmax', 'margin'], default='score')
   parser.add_argument('--model', type=str, default='unifiedQA-uncased/best-model.pt')
+  parser.add_argument('--model_type', type=str, default='bart', choices=['bart', 'gpt2'])
   parser.add_argument('--data', type=str, help='path to the data')
   parser.add_argument('--num_options', type=int, help='max number of candidate answers', default=0)
   parser.add_argument('--domains', type=str, default='clean_test_domains')
@@ -170,27 +183,50 @@ if __name__ == '__main__':
   args = parser.parse_args()
 
   device = 'cuda'
-  max_input_len = 512
-  max_target_len = 128
-  base_model = 'facebook/bart-large'
-  append_bos = True
-  if args.task == 'score':
+
+  if args.model_type == 'bart':
+    base_model = 'facebook/bart-large'
+    append_bos = True
+    append_eos = False
+    qa_merge = False
+    max_input_len = 512
+    max_target_len = 128
     args.max_token_per_batch = 5000
+  elif args.model_type == 'gpt2':
+    base_model = 'gpt2-large'
+    append_bos = False
+    append_eos = True
+    qa_merge = True
+    max_input_len = 256
+    max_target_len = 128
+    args.max_token_per_batch = 512
   else:
-    args.max_token_per_batch = 5000
+    raise NotImplementedError
 
   print('init data')
-  tokenizer = BartTokenizer.from_pretrained(base_model)
+  if args.model_type == 'bart':
+    tokenizer = BartTokenizer.from_pretrained(base_model)
+  elif args.model_type == 'gpt2':
+    tokenizer = GPT2TokenizerFast.from_pretrained(base_model)
+  else:
+    raise NotImplementedError
+
   def get_iter():
     data = read_qa_data(args.data, eval(args.domains.upper()), split=args.split, has_ret=args.has_ret, use_inp=args.use_inp, load=args.num_options > 0)
-    iter = string_to_tensor(tokenizer, data, max_input_len=max_input_len, max_target_len=max_target_len, max_token_per_batch=args.max_token_per_batch, append_bos=append_bos, num_options=args.num_options, device=device)
+    iter = string_to_tensor(tokenizer, data, max_input_len=max_input_len, max_target_len=max_target_len, max_token_per_batch=args.max_token_per_batch,
+                            append_bos=append_bos, append_eos=append_eos, num_options=args.num_options, qa_merge=qa_merge, device=device)
     return iter
 
   print('loading models ...')
   if args.model == 'facebook/bart-large':
     model = MyBart.from_pretrained(base_model).to(device)
   else:
-    model = MyBart.from_pretrained(base_model, state_dict=torch.load(args.model)).to(device)
+    if args.model_type == 'bart':
+      model = MyBart.from_pretrained(base_model, state_dict=torch.load(args.model)).to(device)
+    elif args.model_type == 'gpt2':
+      model = MyGPT2.from_pretrained(base_model, state_dict=torch.load(args.model)).to(device)
+    else:
+      raise NotImplementedError
 
   os.makedirs(os.path.dirname(args.output), exist_ok=True)
   if args.task == 'score':
@@ -217,15 +253,23 @@ if __name__ == '__main__':
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.lr, eps=args.adam_epsilon)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.steps)
     global_step = 0
-    #pbar = tqdm()
+    pbar = tqdm()
     losses = []
     while True:
       iter = get_iter()
       for num_question, input_dict in iter:
-        loss = model(input_ids=input_dict['input'], attention_mask=input_dict['input_mask'],
-                     decoder_input_ids=input_dict['target'], decoder_attention_mask=input_dict['target_mask'],
-                     is_training=True, sample_ind=input_dict['sample_ind'], objective=args.task,
-                     num_question=num_question, num_options=args.num_options)
+        if args.model_type == 'bart':
+          loss = model(input_ids=input_dict['input'], attention_mask=input_dict['input_mask'],
+                       decoder_input_ids=input_dict['target'], decoder_attention_mask=input_dict['target_mask'],
+                       is_training=True, sample_ind=input_dict['sample_ind'], objective=args.task,
+                       num_question=num_question, num_options=args.num_options)
+        elif args.model_type == 'gpt2':
+          loss = model(input_ids=input_dict['input'], attention_mask=input_dict['input_mask'],
+                       loss_mask=input_dict['loss_mask'], labels=input_dict['input'],
+                       sample_ind=input_dict['sample_ind'], objective=args.task,
+                       num_question=num_question, num_options=args.num_options)
+        else:
+          raise NotImplementedError
         loss.backward()
         losses.append(loss.detach().cpu().numpy())
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -233,10 +277,10 @@ if __name__ == '__main__':
         scheduler.step()
         model.zero_grad()
         global_step += 1
-        #pbar.update(1)
+        pbar.update(1)
         if global_step % 100 == 0:
           print('step {}, loss {}'.format(global_step, np.mean(losses[-100:])), flush=True)
-        if global_step % 2000 == 0:
+        if global_step % 4000 == 0:
           model_state_dict = {k: v.cpu() for (k, v) in model.state_dict().items()}
           torch.save(model_state_dict, '{}.{}'.format(args.output, global_step))
           print('save at {}'.format(global_step), flush=True)
@@ -246,4 +290,4 @@ if __name__ == '__main__':
         break
     model_state_dict = {k: v.cpu() for (k, v) in model.state_dict().items()}
     torch.save(model_state_dict, '{}.{}'.format(args.output, global_step))
-    #pbar.close()
+    pbar.close()
