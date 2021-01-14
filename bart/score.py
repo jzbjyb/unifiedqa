@@ -7,7 +7,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from transformers import BartTokenizer, GPT2TokenizerFast, AdamW, get_linear_schedule_with_warmup
+from transformers import BartTokenizer, GPT2TokenizerFast, AdamW, get_linear_schedule_with_warmup, BartForConditionalGeneration
 from bart import MyBart
 from gpt2 import MyGPT2
 CLEAN_TEST_DOMAINS = [('arc_hard', ('train', 'dev', 'test')),
@@ -163,9 +163,9 @@ def string_to_tensor(tokenizer,
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='score targets using models from transformers')
-  parser.add_argument('--task', type=str, choices=['score', 'softmax', 'margin'], default='score')
+  parser.add_argument('--task', type=str, choices=['score', 'softmax', 'margin', 'generate'], default='score')
   parser.add_argument('--model', type=str, default='unifiedQA-uncased/best-model.pt')
-  parser.add_argument('--model_type', type=str, default='bart', choices=['bart', 'gpt2'])
+  parser.add_argument('--model_type', type=str, default='bart', choices=['bart', 'gpt2', 'bart_raw'])
   parser.add_argument('--data', type=str, help='path to the data')
   parser.add_argument('--num_options', type=int, help='max number of candidate answers', default=0)
   parser.add_argument('--domains', type=str, default='clean_test_domains')
@@ -184,7 +184,7 @@ if __name__ == '__main__':
 
   device = 'cuda'
 
-  if args.model_type == 'bart':
+  if args.model_type in {'bart', 'bart_raw'}:
     base_model = 'facebook/bart-large'
     append_bos = True
     append_eos = False
@@ -204,7 +204,7 @@ if __name__ == '__main__':
     raise NotImplementedError
 
   print('init data')
-  if args.model_type == 'bart':
+  if args.model_type in {'bart', 'bart_raw'}:
     tokenizer = BartTokenizer.from_pretrained(base_model)
   elif args.model_type == 'gpt2':
     tokenizer = GPT2TokenizerFast.from_pretrained(base_model)
@@ -223,13 +223,24 @@ if __name__ == '__main__':
   else:
     if args.model_type == 'bart':
       model = MyBart.from_pretrained(base_model, state_dict=torch.load(args.model)).to(device)
+    elif args.model_type == 'bart_raw':
+      model = BartForConditionalGeneration.from_pretrained(base_model, state_dict=torch.load(args.model)).to(device)
     elif args.model_type == 'gpt2':
       model = MyGPT2.from_pretrained(base_model, state_dict=torch.load(args.model)).to(device)
     else:
       raise NotImplementedError
 
   os.makedirs(os.path.dirname(args.output), exist_ok=True)
-  if args.task == 'score':
+  if args.task == 'generate':
+    model.eval()
+    with open(args.data, 'r') as fin, open(args.output, 'w') as fout:
+      for l in tqdm(fin):
+        question = l.strip()
+        res = model.generate(torch.LongTensor([[0] + tokenizer.encode(question)]).to(device),
+                             num_beams=1, min_length=1, max_length=50, early_stopping=False, num_return_sequences=1)
+        res = [tokenizer.decode(x, skip_special_tokens=True).strip() for x in res]
+        fout.write('{}\n'.format(res[0]))
+  elif args.task == 'score':
     model.eval()
     iter = get_iter()
     pbar = tqdm()
